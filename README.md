@@ -104,4 +104,4 @@ python .\import_linkdata_lang.py LINKDATA_LANG_ENG.BIN extracted_lang_eng LINKDA
 
 ## Credits
 
-Thanks to * **[Ahtheerr](https://github.com/Ahtheerr)** for consultation.
+Thanks to **[Ahtheerr](https://github.com/Ahtheerr)** for consultation.
