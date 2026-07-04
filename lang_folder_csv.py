@@ -1,7 +1,6 @@
 from pathlib import Path
 import argparse
 import csv
-import shutil
 import struct
 
 
@@ -26,6 +25,13 @@ def decode_string(data, start, length):
     return raw.decode("utf-8", errors="replace")
 
 
+def looks_like_text(text):
+    if text == "":
+        return False
+    printable = sum(1 for ch in text if ch in "\r\n\t" or ch.isprintable())
+    return printable == len(text)
+
+
 def parse_inner(path):
     data = Path(path).read_bytes()
     if len(data) < 0x20:
@@ -34,7 +40,8 @@ def parse_inner(path):
     version, header_size, zero_a, zero_b, count, group = struct.unpack_from("<6I", data, 0)
     if (version, header_size, zero_a, zero_b) != (1, 0x10, 0, 0):
         raise ValueError(f"{path}: unexpected header")
-    if count < 1 or 0x18 + count * 8 > len(data):
+    table_end = 0x18 + count * 8
+    if count < 1 or table_end + 4 > len(data):
         raise ValueError(f"{path}: bad record count {count}")
 
     records = [
@@ -42,6 +49,7 @@ def parse_inner(path):
         for i in range(count)
     ]
     meta_a, meta_b = records[0]
+    tail_length = struct.unpack_from("<I", data, table_end)[0]
 
     strings = []
     for record_index, (length, end_minus_10) in enumerate(records[1:], start=1):
@@ -58,9 +66,32 @@ def parse_inner(path):
                 "start": start,
                 "end": end,
                 "end_minus_10": end_minus_10,
+                "indexed": True,
+                "tail_length_offset": None,
                 "text": decode_string(data, start, length),
             }
         )
+
+    tail_start = max((item["end"] for item in strings), default=table_end + 4)
+    if tail_length not in (0, 0xFFFFFFFF):
+        tail_end = tail_start + tail_length
+        if tail_start <= tail_end <= len(data):
+            raw_tail = data[tail_start:tail_end]
+            if raw_tail.endswith(b"\0"):
+                text = decode_string(data, tail_start, tail_length)
+                if text == "" or looks_like_text(text):
+                    strings.append(
+                        {
+                            "record": count,
+                            "length": tail_length,
+                            "start": tail_start,
+                            "end": tail_end,
+                            "end_minus_10": tail_end - 0x10,
+                            "indexed": False,
+                            "tail_length_offset": table_end,
+                            "text": text,
+                        }
+                    )
 
     return {
         "data": data,
@@ -109,12 +140,12 @@ def load_translations(input_csv):
     with open(input_csv, "r", newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for row in reader:
+            translated = row.get("translated", "")
+            if translated == "":
+                continue
             file_name = row["file"]
             record = int(row["record"])
-            original = row["original"]
-            translated = row.get("translated", "")
-            text = translated if translated != "" else original
-            by_file.setdefault(file_name, {})[record] = text
+            by_file.setdefault(file_name, {})[record] = translated
     return by_file
 
 
@@ -141,7 +172,12 @@ def rebuild_file(path, translations):
         start = len(rebuilt)
         rebuilt.extend(raw)
         end = len(rebuilt)
-        records[item["record"]] = (len(raw), end - 0x10)
+        if item.get("indexed", True):
+            records[item["record"]] = (len(raw), end - 0x10)
+        else:
+            tail_length_offset = item.get("tail_length_offset")
+            if tail_length_offset is not None:
+                rebuilt[tail_length_offset : tail_length_offset + 4] = struct.pack("<I", len(raw))
         cursor = item["end"]
 
     rebuilt.extend(data[last_string_end:])

@@ -32,6 +32,21 @@ def compress_payload(data):
     return bytes(payload)
 
 
+def find_extracted_file(input_folder, index, old_block_offset):
+    exact = input_folder / f"{index:04d}_{old_block_offset:08x}.bin"
+    if exact.exists():
+        return exact
+
+    candidates = sorted(input_folder.glob(f"{index:04d}_*.bin"))
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise FileNotFoundError(
+            f"missing extracted file for entry {index:04d}, old block {old_block_offset:#x}"
+        )
+    raise FileExistsError(f"multiple extracted files match entry {index:04d}: {candidates[:5]}")
+
+
 def import_folder(original_bin, input_folder, output_bin):
     original = Path(original_bin).read_bytes()
     total_payload, entry_count, unknown, zero = struct.unpack_from("<4I", original, 0)
@@ -48,11 +63,8 @@ def import_folder(original_bin, input_folder, output_bin):
 
     payload = bytearray()
     new_entries = []
-    for index, (file_id, flags, old_packed_size, old_unpacked_size) in enumerate(old_entries):
-        candidates = list(input_folder.glob(f"{index:04d}_{file_id:08x}.bin"))
-        if not candidates:
-            raise FileNotFoundError(f"missing extracted file for entry {index:04d}, id {file_id:#x}")
-        data = candidates[0].read_bytes()
+    for index, (old_block_offset, flags, _old_packed_size, _old_unpacked_size) in enumerate(old_entries):
+        data = find_extracted_file(input_folder, index, old_block_offset).read_bytes()
         packed = compress_payload(data)
         offset = PAYLOAD_START + len(payload)
         if offset % ALIGN != 0:

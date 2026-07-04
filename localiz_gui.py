@@ -37,6 +37,13 @@ def decode_string(data, start, length):
     return raw.decode("utf-8", errors="replace")
 
 
+def looks_like_text(text):
+    if text == "":
+        return False
+    printable = sum(1 for ch in text if ch in "\r\n\t" or ch.isprintable())
+    return printable == len(text)
+
+
 def unpack_linkdata(path, outdir, log=print):
     data = Path(path).read_bytes()
     total_payload, entry_count, unknown, zero = struct.unpack_from("<4I", data, 0)
@@ -53,13 +60,17 @@ def unpack_linkdata(path, outdir, log=print):
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    pos = PAYLOAD_START
+    payload_end = PAYLOAD_START
     extracted = []
-    for index, (file_id, flags, packed_size, unpacked_size) in enumerate(entries):
-        start = pos
+    for index, (block_offset, flags, packed_size, unpacked_size) in enumerate(entries):
+        start = block_offset * ALIGN
         end = start + packed_size
         if flags != 0:
             raise ValueError(f"entry {index} has unexpected flags: {flags:#x}")
+        if start < PAYLOAD_START or end > len(data):
+            raise ValueError(
+                f"entry {index} points outside payload: start={start:#x}, end={end:#x}"
+            )
 
         expected_size, zsize = struct.unpack_from("<2I", data, start)
         cursor = start + 8
@@ -82,22 +93,22 @@ def unpack_linkdata(path, outdir, log=print):
         if terminator != b"\0\0\0\0":
             raise ValueError(f"entry {index} has unexpected terminator: {terminator.hex()}")
 
-        name = f"{index:04d}_{file_id:08x}.bin"
+        name = f"{index:04d}_{block_offset:08x}.bin"
         (outdir / name).write_bytes(unpacked)
-        extracted.append((index, file_id, start, packed_size, unpacked_size, len(chunks)))
-        pos += align_up(packed_size)
+        extracted.append((index, block_offset, start, packed_size, unpacked_size, len(chunks)))
+        payload_end = max(payload_end, align_up(end))
 
-    if pos != len(data):
-        raise ValueError(f"payload end mismatch: got {pos:#x}, file size {len(data):#x}")
+    if payload_end != len(data):
+        raise ValueError(f"payload end mismatch: got {payload_end:#x}, file size {len(data):#x}")
 
     log(f"header total_payload={total_payload:#x} entries={entry_count} unknown={unknown:#x}")
     log(f"extracted {len(extracted)} entries to {outdir}")
     chunked = [item for item in extracted if item[-1] > 1]
     if chunked:
         log("chunked entries:")
-        for index, file_id, start, packed_size, unpacked_size, chunks in chunked:
+        for index, block_offset, start, packed_size, unpacked_size, chunks in chunked:
             log(
-                f"  {index:04d} id={file_id:#x} offset={start:#x} "
+                f"  {index:04d} block={block_offset:#x} offset={start:#x} "
                 f"packed={packed_size} unpacked={unpacked_size} chunks={chunks}"
             )
 
@@ -121,6 +132,21 @@ def compress_payload(data):
     return bytes(payload)
 
 
+def find_extracted_file(input_folder, index, old_block_offset):
+    exact = input_folder / f"{index:04d}_{old_block_offset:08x}.bin"
+    if exact.exists():
+        return exact
+
+    candidates = sorted(input_folder.glob(f"{index:04d}_*.bin"))
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise FileNotFoundError(
+            f"missing extracted file for entry {index:04d}, old block {old_block_offset:#x}"
+        )
+    raise FileExistsError(f"multiple extracted files match entry {index:04d}: {candidates[:5]}")
+
+
 def import_folder_to_linkdata(original_bin, input_folder, output_bin, log=print):
     original = Path(original_bin).read_bytes()
     total_payload, entry_count, unknown, zero = struct.unpack_from("<4I", original, 0)
@@ -137,11 +163,8 @@ def import_folder_to_linkdata(original_bin, input_folder, output_bin, log=print)
 
     payload = bytearray()
     new_entries = []
-    for index, (file_id, flags, _old_packed_size, _old_unpacked_size) in enumerate(old_entries):
-        candidates = list(input_folder.glob(f"{index:04d}_{file_id:08x}.bin"))
-        if not candidates:
-            raise FileNotFoundError(f"missing extracted file for entry {index:04d}, id {file_id:#x}")
-        data = candidates[0].read_bytes()
+    for index, (old_block_offset, flags, _old_packed_size, _old_unpacked_size) in enumerate(old_entries):
+        data = find_extracted_file(input_folder, index, old_block_offset).read_bytes()
         packed = compress_payload(data)
         offset = PAYLOAD_START + len(payload)
         if offset % ALIGN != 0:
@@ -173,7 +196,8 @@ def parse_inner(path):
     version, header_size, zero_a, zero_b, count, group = struct.unpack_from("<6I", data, 0)
     if (version, header_size, zero_a, zero_b) != (1, 0x10, 0, 0):
         raise ValueError(f"{path}: unexpected header")
-    if count < 1 or 0x18 + count * 8 > len(data):
+    table_end = 0x18 + count * 8
+    if count < 1 or table_end + 4 > len(data):
         raise ValueError(f"{path}: bad record count {count}")
 
     records = [
@@ -181,6 +205,7 @@ def parse_inner(path):
         for i in range(count)
     ]
     meta_a, meta_b = records[0]
+    tail_length = struct.unpack_from("<I", data, table_end)[0]
 
     strings = []
     for record_index, (length, end_minus_10) in enumerate(records[1:], start=1):
@@ -197,9 +222,32 @@ def parse_inner(path):
                 "start": start,
                 "end": end,
                 "end_minus_10": end_minus_10,
+                "indexed": True,
+                "tail_length_offset": None,
                 "text": decode_string(data, start, length),
             }
         )
+
+    tail_start = max((item["end"] for item in strings), default=table_end + 4)
+    if tail_length not in (0, 0xFFFFFFFF):
+        tail_end = tail_start + tail_length
+        if tail_start <= tail_end <= len(data):
+            raw_tail = data[tail_start:tail_end]
+            if raw_tail.endswith(b"\0"):
+                text = decode_string(data, tail_start, tail_length)
+                if text == "" or looks_like_text(text):
+                    strings.append(
+                        {
+                            "record": count,
+                            "length": tail_length,
+                            "start": tail_start,
+                            "end": tail_end,
+                            "end_minus_10": tail_end - 0x10,
+                            "indexed": False,
+                            "tail_length_offset": table_end,
+                            "text": text,
+                        }
+                    )
 
     return {
         "data": data,
@@ -248,12 +296,12 @@ def load_translations(input_csv):
     with open(input_csv, "r", newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for row in reader:
+            translated = row.get("translated", "")
+            if translated == "":
+                continue
             file_name = row["file"]
             record = int(row["record"])
-            original = row["original"]
-            translated = row.get("translated", "")
-            text = translated if translated != "" else original
-            by_file.setdefault(file_name, {})[record] = text
+            by_file.setdefault(file_name, {})[record] = translated
     return by_file
 
 
@@ -280,7 +328,12 @@ def rebuild_file(path, translations):
         start = len(rebuilt)
         rebuilt.extend(raw)
         end = len(rebuilt)
-        records[item["record"]] = (len(raw), end - 0x10)
+        if item.get("indexed", True):
+            records[item["record"]] = (len(raw), end - 0x10)
+        else:
+            tail_length_offset = item.get("tail_length_offset")
+            if tail_length_offset is not None:
+                rebuilt[tail_length_offset : tail_length_offset + 4] = struct.pack("<I", len(raw))
         cursor = item["end"]
 
     rebuilt.extend(data[last_string_end:])
